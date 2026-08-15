@@ -1,0 +1,133 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id           String   @id @default(uuid())
+  role         String   // 'student' | 'admin'
+  fullName     String
+  email        String   @unique
+  universityId String?
+  department   String?
+  permissions  String?  @default("[]")
+  isSuperAdmin Boolean  @default(false)
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  password     String   // Hashed password or quick pin
+  createdAt    DateTime @default(now())
+
+  conversations Conversation[] @relation("StudentConversations")
+}
+
+model Department {
+  id           String   @id @default(uuid())
+  key          String   @unique
+  nameAr       String
+  nameEn       String?
+  icon         String   @default("graduation-cap")
+  colorToken   String   @default("teal")
+  displayOrder Int      @default(0)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  doctors Doctor[]
+}
+
+model Doctor {
+  id                  String      @id @default(uuid())
+  fullName            String
+  title               String?     // e.g. 'عميد الكلية', 'رئيس قسم'
+  department          String?
+  specialty           String?
+  courses             String?     // Comma-separated list of courses
+  avatarUrl           String?
+  officeLocation      String?
+  bio                 String?
+  lastSeenAt          DateTime?
+  whatsappNumberEnc   String      // Encrypted AES-256-GCM
+  isActive            Boolean     @default(true)
+  createdAt           DateTime    @default(now())
+
+  departmentId        String?
+  departmentRef       Department? @relation(fields: [departmentId], references: [id])
+
+  conversations Conversation[]
+
+  @@index([departmentId])
+}
+
+model Conversation {
+  id            String   @id @default(uuid())
+  studentId     String
+  student       User     @relation("StudentConversations", fields: [studentId], references: [id], onDelete: Cascade)
+  doctorId      String
+  doctor        Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  subject       String
+  referenceCode String   @unique // e.g. REQ-1042
+  status        String   @default("open") // 'open' | 'answered' | 'closed'
+  createdAt     DateTime @default(now())
+
+  messages Message[]
+
+  @@index([studentId])
+  @@index([doctorId])
+  @@index([status])
+}
+
+model Message {
+  id                String       @id @default(uuid())
+  conversationId    String
+  conversation      Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderType        String       // 'student' | 'doctor'
+  content           String
+  imageUrl          String?
+  audioUrl          String?
+  documentUrl       String?
+  documentName      String?
+  whatsappMessageId String?      // wamid or message key
+  direction         String       // 'outbound' | 'inbound'
+  status            String       @default("sent") // 'sent' | 'delivered' | 'read' | 'failed'
+  createdAt         DateTime     @default(now())
+
+  @@index([conversationId])
+  @@index([whatsappMessageId])
+}
+
+model WebhookEvent {
+  id         String   @id @default(uuid())
+  rawPayload String   // JSON string
+  processed  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  userType  String   @default("student")
+  endpoint  String
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  @@unique([userId, endpoint])
+  @@index([userId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  userType  String   @default("student")
+  type      String   @default("new_reply")
+  title     String
+  body      String
+  link      String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+}
