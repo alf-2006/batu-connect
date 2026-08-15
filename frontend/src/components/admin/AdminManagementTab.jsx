@@ -52,16 +52,13 @@ export default function AdminManagementTab({ currentAdminId }) {
   // Delete Confirmation State
   const [deletingAdmin, setDeletingAdmin] = useState(null);
 
-  const getAuthToken = () => localStorage.getItem('studentToken') || localStorage.getItem('adminToken');
+
 
   const fetchSubAdmins = async () => {
     try {
       setLoading(true);
       setError(null);
-      const token = getAuthToken();
-      const res = await fetch('/api/admin/sub-admins', {
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
-      });
+      const res = await fetch('/api/admin/sub-admins');
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'فشل جلب قائمة المشرفين');
       setAdmins(data);
@@ -141,7 +138,6 @@ export default function AdminManagementTab({ currentAdminId }) {
 
     try {
       setSubmitting(true);
-      const token = getAuthToken();
       const url = modalMode === 'create' ? '/api/admin/sub-admins' : `/api/admin/sub-admins/${selectedAdminId}`;
       const method = modalMode === 'create' ? 'POST' : 'PUT';
 
@@ -156,8 +152,7 @@ export default function AdminManagementTab({ currentAdminId }) {
       const res = await fetch(url, {
         method,
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(payload)
       });
@@ -179,10 +174,8 @@ export default function AdminManagementTab({ currentAdminId }) {
   const handleToggleStatus = async (adm) => {
     if (adm.isSuperAdmin) return;
     try {
-      const token = getAuthToken();
       const res = await fetch(`/api/admin/sub-admins/${adm.id}/status`, {
-        method: 'PATCH',
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
+        method: 'PATCH'
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'فشل تغيير حالة المشرف');
@@ -195,10 +188,8 @@ export default function AdminManagementTab({ currentAdminId }) {
   const handleDeleteAdmin = async () => {
     if (!deletingAdmin) return;
     try {
-      const token = getAuthToken();
       const res = await fetch(`/api/admin/sub-admins/${deletingAdmin.id}`, {
-        method: 'DELETE',
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
+        method: 'DELETE'
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'فشل حذف المشرف');

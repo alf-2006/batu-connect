@@ -26,7 +26,7 @@ export default function StudentLoginModal({ isOpen, onClose, onLoginSuccess }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'فشل تسجيل الدخول');
 
-      localStorage.setItem('studentToken', data.token);
+      // حفظ بيانات الطالب في LocalStorage
       localStorage.setItem('studentUser', JSON.stringify(data.user));
       onLoginSuccess(data.user);
       onClose();

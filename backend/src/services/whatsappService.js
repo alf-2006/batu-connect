@@ -12,18 +12,22 @@ let connectionLogs = [];
 let ffmpegAvailable = false;
 
 // -------------------------------------------------------------
-// Smart Message Queue & Rate Limiting Engine Config
+// Database-Backed Smart Message Queue & Rate Limiting Engine Config
 // -------------------------------------------------------------
-const BATCH_LIMIT = 60;                    // Maximum messages per batch
-const COOLDOWN_DURATION_MS = 5 * 60 * 1000;  // 5 minutes cooldown after 60 messages
-const MIN_DELAY_MS = 2000;                 // Minimum random delay between messages (2s)
-const MAX_DELAY_MS = 4000;                 // Maximum random delay between messages (4s)
+const MAX_RETRIES = 5;
 
-const messageQueue = [];
+// -------------------------------------------------------------
+// Database-Backed Smart Message Queue & Rate Limiting Engine Config
+// -------------------------------------------------------------
+const RATE_LIMIT_PER_DOCTOR = 10;           // Max messages per doctor per minute
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;    // 1 minute window
+const MIN_DELAY_MS = 2000;                 // Minimum delay (2s)
+const MAX_DELAY_MS = 4000;                 // Maximum delay (4s)
+
+const doctorRateLimits = new Map();
 let isQueueProcessing = false;
-let batchCount = 0;
-let isCoolingDown = false;
-let cooldownUntil = null;
+let pendingQueueCount = 0;
+let queuePollingInterval = null;
 
 function logEvent(msg) {
   const timestamp = new Date().toLocaleTimeString('ar-EG');
@@ -35,11 +39,10 @@ function logEvent(msg) {
 
 function getQueueMetrics() {
   return {
-    pendingCount: messageQueue.length,
-    currentBatchCount: batchCount,
-    maxBatchLimit: BATCH_LIMIT,
-    isCoolingDown,
-    cooldownUntil
+    pendingCount: pendingQueueCount,
+    rateLimitPerMinute: RATE_LIMIT_PER_DOCTOR,
+    isCoolingDown: false,
+    cooldownUntil: null
   };
 }
 
@@ -98,136 +101,269 @@ function convertAudioToOggOpus(inputPath) {
 }
 
 /**
- * Worker Loop: Processes items in the message queue with rate-limiting and human delays
+ * Worker Loop: Processes items in the DB queue with atomic claims, backoff, and rate-limiting
  */
-async function triggerQueueProcessing() {
-  if (isQueueProcessing || isCoolingDown) return;
+async function processDatabaseQueue() {
+  if (isQueueProcessing) return;
   isQueueProcessing = true;
 
-  while (messageQueue.length > 0) {
+  try {
     if (connectionStatus !== 'connected' || !sock) {
-      logEvent('[طابور ذكي ⏸️] تعذر الإرسال مؤقتاً، في انتظار استقرار اتصال الواتساب...');
-      break;
+      isQueueProcessing = false;
+      return;
     }
 
-    // Check Batch Limit Threshold
-    if (batchCount >= BATCH_LIMIT) {
-      isCoolingDown = true;
-      cooldownUntil = Date.now() + COOLDOWN_DURATION_MS;
-      logEvent(`[طابور ذكي ⏸️] تم إرسال ${BATCH_LIMIT} رسالة بنجاح. تفعيل فترة الاستراحة (5 دقائق) لحماية رقم الواتساب من الحظر...`);
-      emitStatusUpdate();
+    pendingQueueCount = await prisma.message.count({ 
+      where: { 
+        status: 'queued',
+        OR: [
+          { nextRetryAt: null },
+          { nextRetryAt: { lte: new Date() } }
+        ]
+      } 
+    });
 
-      await new Promise((resolve) => setTimeout(resolve, COOLDOWN_DURATION_MS));
-
-      batchCount = 0;
-      isCoolingDown = false;
-      cooldownUntil = null;
-      logEvent('[طابور ذكي ▶️] انتهت فترة الاستراحة (5 دقائق)، جاري استئناف إرسال الرسائل في الطابور...');
-      emitStatusUpdate();
+    if (pendingQueueCount === 0) {
+      isQueueProcessing = false;
+      return;
     }
 
-    const task = messageQueue.shift();
-    if (!task) break;
+    // Find the next eligible message
+    const nextMsg = await prisma.message.findFirst({
+      where: { 
+        status: 'queued',
+        direction: 'outbound',
+        OR: [
+          { nextRetryAt: null },
+          { nextRetryAt: { lte: new Date() } }
+        ]
+      },
+      orderBy: { createdAt: 'asc' }
+    });
 
-    // Random delay to simulate human typing behavior (2 to 4 seconds)
+    if (!nextMsg) {
+      isQueueProcessing = false;
+      return;
+    }
+
+    // Atomic Claim: Try to update status from 'queued' to 'processing'
+    const claimResult = await prisma.message.updateMany({
+      where: { id: nextMsg.id, status: 'queued' },
+      data: { status: 'processing' }
+    });
+
+    if (claimResult.count === 0) {
+      // Someone else claimed it, or it was modified
+      isQueueProcessing = false;
+      return;
+    }
+
+    // Re-fetch the claimed message with full relations
+    const taskMsg = await prisma.message.findUnique({
+      where: { id: nextMsg.id },
+      include: {
+        conversation: {
+          include: { doctor: true, student: true }
+        }
+      }
+    });
+
+    if (!taskMsg || !taskMsg.conversation || !taskMsg.conversation.doctor) {
+      if (taskMsg) await prisma.message.update({ where: { id: taskMsg.id }, data: { status: 'failed', lastErrorCode: 'MISSING_RELATIONS' } });
+      isQueueProcessing = false;
+      return;
+    }
+
+    const doctorPhoneRaw = decryptPhoneNumber(taskMsg.conversation.doctor.whatsappNumberEnc);
+    if (!doctorPhoneRaw) {
+      await prisma.message.update({ where: { id: taskMsg.id }, data: { status: 'failed', lastErrorCode: 'DECRYPT_FAILED' } });
+      isQueueProcessing = false;
+      return;
+    }
+
+    const doctorJid = formatWhatsAppJid(doctorPhoneRaw);
+
+    const now = Date.now();
+    let doctorLimits = doctorRateLimits.get(doctorJid) || [];
+    doctorLimits = doctorLimits.filter(ts => now - ts < RATE_LIMIT_WINDOW_MS);
+    
+    // Check limits (we will count 1 for normal, 2 for composite if text wasn't sent)
+    const cost = (taskMsg.audioUrl && !taskMsg.headerWamid) ? 2 : 1;
+    
+    if (doctorLimits.length + cost > RATE_LIMIT_PER_DOCTOR) {
+      doctorRateLimits.set(doctorJid, doctorLimits);
+      // Revert to queued, delay a bit
+      await prisma.message.update({ 
+        where: { id: taskMsg.id }, 
+        data: { status: 'queued', nextRetryAt: new Date(Date.now() + 5000) } 
+      });
+      isQueueProcessing = false;
+      return;
+    }
+
+    const student = taskMsg.conversation.student;
+    const gradCap = String.fromCodePoint(0x1F393);
+    const replyIcon = String.fromCodePoint(0x21A9, 0xFE0F);
+    
+    const isFollowUp = (await prisma.message.count({ where: { conversationId: taskMsg.conversationId, senderType: 'student' } })) > 1;
+    
+    let formattedMessageText = `${gradCap} *منصة التواصل الأكاديمي*
+
+*بيانات الطالب${isFollowUp ? ' (متابعة)' : ''}*
+> الاسم: ${student.fullName}
+> رقم واتساب: ${student.phone || student.whatsappNumber || 'غير مسجل'}
+> الرقم الأكاديمي: ${student.universityId || 'غير محدد'}
+${!isFollowUp ? `> التخصص: ${student.department || 'غير محدد'}\n> السنة الدراسية: ${student.academicYear || 'غير محدد'}` : ''}
+
+*نص الرسالة*
+> ${taskMsg.content || (taskMsg.documentUrl ? `مستند: ${taskMsg.documentName}` : (taskMsg.audioUrl ? 'تسجيل صوتي' : (taskMsg.imageUrl ? 'مرفق صورة' : '')))}
+
+${replyIcon} *للرد:* استخدم Reply على هذه الرسالة.`;
+
     const delay = Math.floor(Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1)) + MIN_DELAY_MS;
-    logEvent(`[طابور ذكي ⏳] انتظار (${(delay / 1000).toFixed(1)} ثانية) لمحاكاة السلوك البشري لحماية الرقم...`);
+    logEvent(`[طابور ⏳] انتظار (${(delay / 1000).toFixed(1)}ث) لمحاكاة السلوك البشري...`);
     await new Promise((r) => setTimeout(r, delay));
 
-    try {
-      let sentMsg;
+    let sentMsg;
+    let newHeaderWamid = taskMsg.headerWamid;
+    let apiCalls = 0;
 
-      if (task.audioUrl) {
-        const fullAudioPath = path.resolve(__dirname, '../../public', task.audioUrl.replace(/^\//, ''));
+    try {
+      if (taskMsg.audioUrl) {
+        const fullAudioPath = path.resolve(__dirname, '../../public', taskMsg.audioUrl.replace(/^\//, ''));
         if (fs.existsSync(fullAudioPath)) {
-          // Convert audio using ffmpeg to standard WhatsApp OGG Opus PTT format
           const targetAudioPath = await convertAudioToOggOpus(fullAudioPath);
           const isConverted = targetAudioPath.endsWith('_converted.ogg');
-
-          let headerWamid = null;
-          // Send description text first if available
-          if (task.formattedMessageText) {
-            try {
-              const headerMsg = await sock.sendMessage(task.doctorJid, { text: task.formattedMessageText });
-              headerWamid = headerMsg?.key?.id || null;
-            } catch (txtErr) {
-              console.error('Error sending audio header text:', txtErr);
-            }
+          
+          if (formattedMessageText && !newHeaderWamid) {
+            const headerMsg = await sock.sendMessage(doctorJid, { text: formattedMessageText });
+            newHeaderWamid = headerMsg?.key?.id || null;
+            apiCalls++;
+            // Save the headerWamid so we don't repeat this step if the audio fails
+            await prisma.message.update({
+              where: { id: taskMsg.id },
+              data: { headerWamid: newHeaderWamid }
+            });
           }
-
-          // Send audio voice note (ptt)
-          sentMsg = await sock.sendMessage(task.doctorJid, {
+          
+          sentMsg = await sock.sendMessage(doctorJid, {
             audio: fs.readFileSync(targetAudioPath),
             mimetype: isConverted ? 'audio/ogg; codecs=opus' : 'audio/mp4',
             ptt: isConverted
           });
-
+          apiCalls++;
+          
           const audioWamid = sentMsg?.key?.id || `WA_${Date.now()}`;
-          sentMsg = { key: { id: headerWamid ? `${headerWamid},${audioWamid}` : audioWamid } };
+          sentMsg = { key: { id: newHeaderWamid ? `${newHeaderWamid},${audioWamid}` : audioWamid } };
         } else {
-          sentMsg = await sock.sendMessage(task.doctorJid, { text: task.formattedMessageText });
+          sentMsg = await sock.sendMessage(doctorJid, { text: formattedMessageText });
+          apiCalls++;
         }
-      } else if (task.imageUrl) {
-        const fullImgPath = path.resolve(__dirname, '../../public', task.imageUrl.replace(/^\//, ''));
+      } else if (taskMsg.imageUrl) {
+        const fullImgPath = path.resolve(__dirname, '../../public', taskMsg.imageUrl.replace(/^\//, ''));
         if (fs.existsSync(fullImgPath)) {
-          sentMsg = await sock.sendMessage(task.doctorJid, {
+          sentMsg = await sock.sendMessage(doctorJid, {
             image: fs.readFileSync(fullImgPath),
-            caption: task.formattedMessageText
+            caption: formattedMessageText
           });
+          apiCalls++;
         } else {
-          sentMsg = await sock.sendMessage(task.doctorJid, { text: task.formattedMessageText });
+          sentMsg = await sock.sendMessage(doctorJid, { text: formattedMessageText });
+          apiCalls++;
         }
-      } else if (task.documentUrl) {
-        const fullDocPath = path.resolve(__dirname, '../../public', task.documentUrl.replace(/^\//, ''));
+      } else if (taskMsg.documentUrl) {
+        const fullDocPath = path.resolve(__dirname, '../../public', taskMsg.documentUrl.replace(/^\//, ''));
         if (fs.existsSync(fullDocPath)) {
           const ext = path.extname(fullDocPath).toLowerCase();
           let mime = 'application/pdf';
           if (ext === '.docx' || ext === '.doc') mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-          else if (ext === '.pptx' || ext === '.ppt') mime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
           else if (ext === '.zip') mime = 'application/zip';
           else if (ext === '.txt') mime = 'text/plain';
-
-          sentMsg = await sock.sendMessage(task.doctorJid, {
+  
+          sentMsg = await sock.sendMessage(doctorJid, {
             document: fs.readFileSync(fullDocPath),
             mimetype: mime,
-            fileName: task.documentName || path.basename(fullDocPath),
-            caption: task.formattedMessageText
+            fileName: taskMsg.documentName || path.basename(fullDocPath),
+            caption: formattedMessageText
           });
+          apiCalls++;
         } else {
-          sentMsg = await sock.sendMessage(task.doctorJid, { text: task.formattedMessageText });
+          sentMsg = await sock.sendMessage(doctorJid, { text: formattedMessageText });
+          apiCalls++;
         }
       } else {
-        sentMsg = await sock.sendMessage(task.doctorJid, { text: task.formattedMessageText });
+        sentMsg = await sock.sendMessage(doctorJid, { text: formattedMessageText });
+        apiCalls++;
+      }
+  
+      const wamid = sentMsg?.key?.id || `WA_${Date.now()}`;
+  
+      await prisma.message.update({
+        where: { id: taskMsg.id },
+        data: { status: 'sent', whatsappMessageId: wamid, lastErrorCode: null }
+      });
+  
+      // Register all calls against rate limit
+      for (let i = 0; i < apiCalls; i++) {
+        doctorLimits.push(Date.now());
+      }
+      doctorRateLimits.set(doctorJid, doctorLimits);
+      pendingQueueCount--;
+  
+      logEvent(`[طابور 📤] تم إرسال الرسالة إلى (${taskMsg.conversation.doctor.fullName}). المتبقي: ${pendingQueueCount}`);
+      emitStatusUpdate();
+
+    } catch (err) {
+      console.error('Error sending message:', err);
+      const statusCode = err?.output?.statusCode || 500;
+      const isTemporary = [429, 408, 425, 500, 502, 503, 504].includes(statusCode) || err.message.includes('timeout') || err.message.includes('disconnect');
+      
+      let nextState = 'failed';
+      let nextRetryAt = null;
+      let newRetryCount = taskMsg.retryCount;
+      
+      if (isTemporary && taskMsg.retryCount < MAX_RETRIES) {
+        newRetryCount++;
+        nextState = 'queued';
+        
+        // Parse Retry-After if available, otherwise exponential backoff + jitter
+        let delayMs = Math.pow(2, newRetryCount) * 1000 + Math.random() * 1000;
+        if (err?.output?.headers && err.output.headers['retry-after']) {
+          const retryAfter = err.output.headers['retry-after'];
+          if (!isNaN(retryAfter)) {
+            delayMs = parseInt(retryAfter) * 1000;
+          } else {
+            const date = new Date(retryAfter);
+            if (!isNaN(date.getTime())) delayMs = Math.max(1000, date.getTime() - Date.now());
+          }
+        }
+        nextRetryAt = new Date(Date.now() + delayMs);
+        logEvent(`[طابور 🔄] فشل إرسال (كود: ${statusCode}). سيتم إعادة المحاولة (${newRetryCount}/${MAX_RETRIES}) في ${Math.floor(delayMs/1000)} ثانية.`);
+      } else {
+        logEvent(`[طابور ❌] فشل إرسال رسالة بشكل دائم أو استنفاد المحاولات (كود: ${statusCode}): ${err.message}`);
       }
 
-      batchCount++;
-      const wamid = sentMsg?.key?.id || `WA_${Date.now()}`;
-      logEvent(`[طابور ذكي 📤] تم إرسال الرسالة إلى (${task.recipientName}) بنجاح! (${batchCount}/${BATCH_LIMIT} في الدفعة الدائرة). المتبقي في الطابور: ${messageQueue.length}`);
-      emitStatusUpdate();
-      task.resolve({ success: true, wamid });
-    } catch (err) {
-      logEvent(`[طابور ذكي ❌] فشل إرسال الرسالة إلى (${task.recipientName}): ${err.message}`);
-      task.reject(err);
+      await prisma.message.update({
+        where: { id: taskMsg.id },
+        data: { 
+          status: nextState, 
+          retryCount: newRetryCount,
+          nextRetryAt: nextRetryAt,
+          lastErrorCode: String(statusCode),
+          lastErrorAt: new Date()
+        }
+      });
     }
+  } catch (outerErr) {
+    console.error('Queue Processing Error:', outerErr);
   }
 
   isQueueProcessing = false;
-}
-
-/**
- * Push outbound message into the Smart Queue
- */
-function enqueueWhatsAppMessage(taskData) {
-  return new Promise((resolve, reject) => {
-    messageQueue.push({
-      ...taskData,
-      resolve,
-      reject
-    });
-    logEvent(`[طابور ذكي 📥] تمت إضافة رسالة جديدة إلى طابور الإرسال. المتبقي في الطابور: ${messageQueue.length}`);
-    emitStatusUpdate();
-    triggerQueueProcessing();
-  });
+  
+  // Continuously process if there are more
+  if (pendingQueueCount > 0) {
+    setTimeout(processDatabaseQueue, 1000);
+  }
 }
 
 /**
@@ -246,6 +382,7 @@ async function initWhatsApp() {
     }
 
     logEvent('جاري تشغيل محرك واتساب Baileys وطابور الرسائل الذكي...');
+    if (queuePollingInterval) { clearInterval(queuePollingInterval); queuePollingInterval = null; }
     connectionStatus = 'connecting';
     ffmpegAvailable = await checkFFmpegAvailability();
     const authDir = path.join(__dirname, '../../baileys_auth_info');
@@ -284,8 +421,9 @@ async function initWhatsApp() {
         qrCodeDataUrl = null;
         emitStatusUpdate();
         // Trigger queue & automatically flush all pending offline messages to WhatsApp!
-        triggerQueueProcessing();
+        processDatabaseQueue();
         flushPendingLocalMessagesToWhatsApp();
+        if (!queuePollingInterval) { queuePollingInterval = setInterval(processDatabaseQueue, 3000); }
       }
 
       if (connection === 'close') {
@@ -327,8 +465,22 @@ async function initWhatsApp() {
  */
 async function handleIncomingWhatsAppMessage(msg) {
   try {
+    const wamid = msg.key?.id || null;
+    
+    // DEDUPLICATION FIX: Use WebhookEvent unique constraint
+    if (wamid) {
+      const existingEvent = await prisma.webhookEvent.findUnique({
+        where: { whatsappMessageId: wamid }
+      });
+      if (existingEvent) {
+        logEvent(`[تكرار ⚠️] التغاضي عن رسالة الواتساب الواردة المكررة (WAMID: ${wamid})`);
+        return;
+      }
+    }
+
     await prisma.webhookEvent.create({
       data: {
+        whatsappMessageId: wamid,
         rawPayload: JSON.stringify(msg),
         processed: false
       }
@@ -342,17 +494,6 @@ async function handleIncomingWhatsAppMessage(msg) {
       msg.message;
 
     if (!realMsg) return;
-
-    // DEDUPLICATION FIX: Prevent processing duplicate incoming WhatsApp messages
-    if (msg.key && msg.key.id) {
-      const existingMessage = await prisma.message.findFirst({
-        where: { whatsappMessageId: msg.key.id }
-      });
-      if (existingMessage) {
-        logEvent(`[تكرار ⚠️] التغاضي عن رسالة الواتساب الواردة المكررة (WAMID: ${msg.key.id})`);
-        return;
-      }
-    }
 
     const senderJid = msg.key.remoteJid || '';
     const participantJid = msg.key.participant || senderJid;
@@ -617,24 +758,10 @@ async function flushPendingLocalMessagesToWhatsApp() {
 
 ${replyIcon} *للرد:* استخدم Reply على هذه الرسالة.`;
 
-        const queueRes = await enqueueWhatsAppMessage({
-          doctorJid,
-          formattedMessageText,
-          imageUrl: msg.imageUrl,
-          audioUrl: msg.audioUrl,
-          documentUrl: msg.documentUrl,
-          documentName: msg.documentName,
-          recipientName: `د. ${conversation.doctor.fullName}`
-        });
-
-        const updatedWamid = queueRes?.wamid || msg.whatsappMessageId;
-
-        // Update message status in DB to 'sent'
         const updatedMsg = await prisma.message.update({
           where: { id: msg.id },
           data: {
-            status: 'sent',
-            whatsappMessageId: updatedWamid
+            status: 'queued'
           }
         });
 
@@ -658,125 +785,44 @@ ${replyIcon} *للرد:* استخدم Reply على هذه الرسالة.`;
  */
 async function sendStudentQuestionToWhatsApp(conversation, student, doctor, questionContent, imageUrl = null) {
   try {
-    let sentWamid = `LOCAL_${Date.now()}_${Math.floor(Math.random()*1000)}`;
-    const doctorPhoneRaw = decryptPhoneNumber(doctor.whatsappNumberEnc);
-
-    if (doctorPhoneRaw && sock && connectionStatus === 'connected') {
-      try {
-        const doctorJid = formatWhatsAppJid(doctorPhoneRaw);
-        const gradCap = String.fromCodePoint(0x1F393);
-        const replyIcon = String.fromCodePoint(0x21A9, 0xFE0F);
-
-        const studentPhone = student.phone || student.whatsappNumber || student.phoneNum || 'غير مسجل';
-        const academicNum = student.universityId || 'غير محدد';
-        const studentDept = student.department || 'تكنولوجيا المعلومات';
-        const studentYear = student.academicYear || student.year || 'الثانية';
-
-        const formattedMessageText =
-`${gradCap} *منصة التواصل الأكاديمي*
-
-*بيانات الطالب*
-> الاسم: ${student.fullName}
-> رقم واتساب: ${studentPhone}
-> الرقم الأكاديمي: ${academicNum}
-> التخصص: ${studentDept}
-> السنة الدراسية: ${studentYear}
-
-*نص الرسالة*
-> ${questionContent || (imageUrl ? 'مرفق صورة مع الاستفسار' : '')}
-
-${replyIcon} *للرد:* استخدم Reply على هذه الرسالة.`;
-
-        const queueRes = await enqueueWhatsAppMessage({
-          doctorJid,
-          formattedMessageText,
-          imageUrl,
-          recipientName: `د. ${doctor.fullName}`
-        });
-        if (queueRes?.wamid) sentWamid = queueRes.wamid;
-      } catch (err) {
-        logEvent(`[طابور/خطأ] تعذر المعالجة الفورية، سيتم حفظها محلياً: ${err.message}`);
-      }
-    } else {
+    const isConnected = (sock && connectionStatus === 'connected');
+    const msgStatus = isConnected ? 'queued' : 'local_only';
+    
+    if (!isConnected) {
       logEvent(`[محلي] وضع الإرسال لكود المحادثة [${conversation.referenceCode}]`);
     }
 
-    // Record outbound student message in DB
     const studentMsg = await prisma.message.create({
       data: {
         conversationId: conversation.id,
         senderType: 'student',
         content: questionContent || (imageUrl ? 'مرفق صورة' : ''),
         imageUrl: imageUrl,
-        whatsappMessageId: sentWamid,
-        direction: 'outbound',
-        status: (sock && connectionStatus === 'connected') ? 'sent' : 'local_only'
-      }
-    });
-
-    return studentMsg;
-
-  } catch (error) {
-    console.error('Failed to send question to WhatsApp:', error);
-    logEvent(`[خطأ] فشل إرسال السؤال عبر الواتساب، سيتم حفظه محلياً: ${error.message}`);
-    
-    // Resilient fallback: Save message locally so UI never errors out
-    return await prisma.message.create({
-      data: {
-        conversationId: conversation.id,
-        senderType: 'student',
-        content: questionContent || '',
-        imageUrl: imageUrl,
         whatsappMessageId: `LOCAL_${Date.now()}`,
         direction: 'outbound',
-        status: 'local_only'
+        status: msgStatus
       }
     });
+
+    if (msgStatus === 'queued') {
+      setTimeout(processDatabaseQueue, 100);
+    }
+    
+    return studentMsg;
+  } catch (error) {
+    console.error('Failed to send question:', error);
+    throw error;
   }
 }
+
 
 /**
  * Sends Follow-up Student Message (text, image, audio, or document) inside existing conversation (via Smart Queue)
  */
 async function sendStudentFollowUpMessageToWhatsApp(conversation, student, doctor, textContent, imageUrl = null, audioUrl = null, documentUrl = null, documentName = null) {
   try {
-    const doctorPhoneRaw = decryptPhoneNumber(doctor.whatsappNumberEnc);
-    if (!doctorPhoneRaw) throw new Error('رقم الدكتور غير متوفر');
-    const doctorJid = formatWhatsAppJid(doctorPhoneRaw);
-
-    const gradCap = String.fromCodePoint(0x1F393);
-    const replyIcon = String.fromCodePoint(0x21A9, 0xFE0F);
-
-    const formattedMessageText =
-`${gradCap} *منصة التواصل الأكاديمي*
-
-*بيانات الطالب (متابعة)*
-> الاسم: ${student.fullName}
-> الرقم الأكاديمي: ${student.universityId || 'غير محدد'}
-
-*نص الرسالة*
-> ${textContent || (documentUrl ? `مستند: ${documentName || 'ملف'}` : (audioUrl ? 'تسجيل صوتي' : (imageUrl ? 'مرفق صورة' : '')))}
-
-${replyIcon} *للرد:* استخدم Reply على هذه الرسالة.`;
-
-    let sentWamid = `LOCAL_${Date.now()}_${Math.floor(Math.random()*1000)}`;
-
-    if (sock && connectionStatus === 'connected') {
-      try {
-        const queueRes = await enqueueWhatsAppMessage({
-          doctorJid,
-          formattedMessageText,
-          imageUrl,
-          audioUrl,
-          documentUrl,
-          documentName,
-          recipientName: `د. ${doctor.fullName}`
-        });
-        if (queueRes?.wamid) sentWamid = queueRes.wamid;
-      } catch (err) {
-        logEvent(`[طابور/خطأ] تعذر المعالجة الفورية للمتابعة: ${err.message}`);
-      }
-    }
+    const isConnected = (sock && connectionStatus === 'connected');
+    const msgStatus = isConnected ? 'queued' : 'local_only';
 
     const studentMsg = await prisma.message.create({
       data: {
@@ -787,17 +833,21 @@ ${replyIcon} *للرد:* استخدم Reply على هذه الرسالة.`;
         audioUrl: audioUrl,
         documentUrl: documentUrl,
         documentName: documentName,
-        whatsappMessageId: sentWamid,
+        whatsappMessageId: `LOCAL_${Date.now()}`,
         direction: 'outbound',
-        status: (sock && connectionStatus === 'connected') ? 'sent' : 'local_only'
+        status: msgStatus
       }
     });
 
     notifyNewMessage(conversation.id, studentMsg);
+    
+    if (msgStatus === 'queued') {
+      setTimeout(processDatabaseQueue, 100);
+    }
+    
     return studentMsg;
-
   } catch (error) {
-    console.error('Failed to send follow-up message:', error);
+    console.error('Failed to send follow up:', error);
     throw error;
   }
 }

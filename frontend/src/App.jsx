@@ -59,10 +59,8 @@ export default function App() {
   }, []);
 
   const getAuthHeaders = () => {
-    const token = localStorage.getItem('studentToken');
     return {
-      'Content-Type': 'application/json',
-      ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+      'Content-Type': 'application/json'
     };
   };
 
@@ -142,8 +140,7 @@ export default function App() {
         return;
       }
 
-      // حفظ التوكن والمستخدم
-      localStorage.setItem('studentToken', data.token);
+      // حفظ المستخدم
       localStorage.setItem('studentUser', JSON.stringify(data.user));
       setCurrentUser(data.user);
       setShowLanding(false);
@@ -171,7 +168,6 @@ export default function App() {
         return;
       }
 
-      localStorage.setItem('studentToken', data.token);
       localStorage.setItem('studentUser', JSON.stringify(data.user));
       setCurrentUser(data.user);
       setShowLanding(false);
@@ -183,13 +179,15 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     if (currentUser?.id) {
       unsubscribeFromWebPush(currentUser.id);
     }
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (e) {}
     setCurrentUser(null);
     localStorage.removeItem('studentUser');
-    localStorage.removeItem('studentToken');
     setShowLanding(true);
     setActiveTab('student');
   };

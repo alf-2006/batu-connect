@@ -78,9 +78,16 @@ router.post('/student-quick', rateLimitAuth(20), async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
     return res.json({
       message: 'تم تسجيل الدخول بنجاح',
-      token,
+      token, // Kept for backwards compatibility if needed temporarily
       user: {
         id: user.id,
         role: user.role,
@@ -140,6 +147,13 @@ router.post('/register', rateLimitAuth(10), async (req, res) => {
       JWT_SECRET,
       { expiresIn: '7d' }
     );
+
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
 
     return res.status(201).json({
       message: 'تم إنشاء الحساب وتناول الدخول بنجاح',
@@ -226,6 +240,13 @@ router.post('/login', rateLimitAuth(10), async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
     return res.json({
       message: 'تم تسجيل الدخول بنجاح',
       token,
@@ -245,6 +266,11 @@ router.post('/login', rateLimitAuth(10), async (req, res) => {
     console.error('Login error:', error);
     return res.status(500).json({ error: 'حدث خطأ في الخادم' });
   }
+});
+
+router.post('/logout', (req, res) => {
+  res.clearCookie('token');
+  res.json({ message: 'تم تسجيل الخروج بنجاح' });
 });
 
 module.exports = router;

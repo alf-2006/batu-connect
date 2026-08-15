@@ -4,7 +4,8 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = 5000;
-const AES_SECRET_KEY = process.env.AES_SECRET_KEY || '4f9d8a2b3c4e5f6a7b8c9d0e1f2a3b4c';
+const AES_SECRET_KEY = process.env.AES_SECRET_KEY;
+if (!AES_SECRET_KEY) throw new Error("FATAL: AES_SECRET_KEY is missing in environment variables.");
 
 // Helper for AES-256-GCM encryption
 function getSecretKey() {

@@ -91,7 +91,12 @@ model Message {
   documentName      String?
   whatsappMessageId String?      // wamid or message key
   direction         String       // 'outbound' | 'inbound'
-  status            String       @default("sent") // 'sent' | 'delivered' | 'read' | 'failed'
+  status            String       @default("queued") // 'queued' | 'processing' | 'sent' | 'delivered' | 'read' | 'failed' | 'local_only'
+  retryCount        Int          @default(0)
+  nextRetryAt       DateTime?
+  lastErrorCode     String?
+  lastErrorAt       DateTime?
+  headerWamid       String?      // Used for tracking text-part of compound messages
   createdAt         DateTime     @default(now())
 
   @@index([conversationId])
@@ -99,10 +104,11 @@ model Message {
 }
 
 model WebhookEvent {
-  id         String   @id @default(uuid())
-  rawPayload String   // JSON string
-  processed  Boolean  @default(false)
-  createdAt  DateTime @default(now())
+  id                String   @id @default(uuid())
+  whatsappMessageId String?  @unique // Used for incoming message deduplication
+  rawPayload        String   // JSON string
+  processed         Boolean  @default(false)
+  createdAt         DateTime @default(now())
 }
 
 model PushSubscription {

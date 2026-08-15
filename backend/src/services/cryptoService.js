@@ -3,7 +3,8 @@ const crypto = require('crypto');
 const ALGORITHM = 'aes-256-gcm';
 // Ensure secret key is exactly 32 bytes (256 bits)
 const getSecretKey = () => {
-  const secret = process.env.AES_SECRET_KEY || '4f9d8a2b3c4e5f6a7b8c9d0e1f2a3b4c';
+  const secret = process.env.AES_SECRET_KEY;
+  if (!secret) throw new Error("FATAL: AES_SECRET_KEY is missing in environment variables.");
   return crypto.scryptSync(secret, 'whatsapp_salt', 32);
 };
 

@@ -1,12 +1,16 @@
 const webpush = require('web-push');
 const prisma = require('../lib/prisma');
 
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BJRLK3DJQtZ_NRfoOzl9hDj1zdDby1WkecCxhIYVg7eSP6OXt-2NO5jq7uG1ilIQgMTXvMaGq92B4WJVDhtH-iI';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'QNUqLz6DxpVIIyBbYaae0REpr8_glMOkNhmoOeHY2gA';
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@batu.edu.eg';
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT;
 
 try {
-  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !VAPID_SUBJECT) {
+    console.warn("WARNING: VAPID keys are missing. Push notifications will be disabled.");
+  } else {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  }
 } catch (err) {
   console.error('Error configuring web-push VAPID:', err);
 }
